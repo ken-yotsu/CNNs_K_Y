@@ -1,0 +1,195 @@
+import argparse
+import datetime
+import json
+import os
+
+import numpy as np
+import matplotlib.pyplot as plt
+import yaml
+
+import tensorflow as tf
+from tensorflow.keras.applications import ResNet50
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Dense, GlobalAveragePooling2D
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, TensorBoard, ReduceLROnPlateau, CSVLogger
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+
+from data_io import read_score_csv, load_zip_dataset
+from metrics import rmse
+
+
+def set_seed(seed: int):
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+
+
+def ensure_dirs(*paths):
+    for p in paths:
+        os.makedirs(p, exist_ok=True)
+
+
+def build_model(image_size: int):
+    base_model = ResNet50(
+        include_top=False,
+        weights='imagenet',
+        input_shape=(image_size, image_size, 3)
+    )
+
+    x = base_model.output
+    x = GlobalAveragePooling2D()(x)
+    x = Dense(1024, activation='relu')(x)
+    predictions = Dense(1)(x)
+
+    model = Model(inputs=base_model.input, outputs=predictions)
+    return model
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--config', default='configs/config.yaml')
+    args = ap.parse_args()
+
+    with open(args.config, 'r', encoding='utf-8') as f:
+        cfg = yaml.safe_load(f)
+
+    # Directories
+    out_tmp = cfg.get('out_tmp_dir', 'tmp')
+    out_model = cfg.get('out_model_dir', 'model')
+    out_log = cfg.get('out_log_dir', 'log')
+    ensure_dirs(out_tmp, out_model, out_log)
+
+    # Seed
+    seed = int(cfg.get('seed', 42))
+    set_seed(seed)
+
+    # Load data
+    image_size = int(cfg.get('image_size', 256))
+    id_offset = int(cfg.get('id_offset', 0))
+
+    score_rows = read_score_csv(cfg['score_csv'])
+
+    X_train, Y_train = load_zip_dataset(cfg['train_zip'], score_rows, image_size, id_offset=id_offset, prefix_regex=r"^ALC100train")
+    X_valid, Y_valid = load_zip_dataset(cfg['val_zip'], score_rows, image_size, id_offset=id_offset, prefix_regex=r"^ALC100val")
+    X_test, Y_test = load_zip_dataset(cfg['test_zip'], score_rows, image_size, id_offset=id_offset, prefix_regex=r"^ALC100test")
+
+    print('Train:', X_train.shape, Y_train.shape)
+    print('Valid:', X_valid.shape, Y_valid.shape)
+    print('Test :', X_test.shape, Y_test.shape)
+
+    # Normalize
+    X_train = X_train.astype('float32') / 255.0
+    X_valid = X_valid.astype('float32') / 255.0
+    X_test = X_test.astype('float32') / 255.0
+
+    # Model
+    model = build_model(image_size)
+    print(model.summary())
+
+    freeze_until = int(cfg.get('freeze_until', 122))
+
+    # Freeze layers [0:freeze_until)
+    for layer in model.layers[:freeze_until]:
+        layer.trainable = False
+        # Keep BatchNorm trainable (mirrors original intent)
+        if layer.name.startswith('batch_normalization') or layer.name.endswith('bn'):
+            layer.trainable = True
+
+    # Train remaining layers
+    for layer in model.layers[freeze_until:]:
+        layer.trainable = True
+
+    lr = float(cfg.get('learning_rate', 0.001))
+    model.compile(optimizer=Adam(learning_rate=lr), loss=rmse)
+
+    # Augmentation
+    datagen = ImageDataGenerator(
+        width_shift_range=float(cfg.get('width_shift_range', 0.1)),
+        height_shift_range=float(cfg.get('height_shift_range', 0.1)),
+        horizontal_flip=bool(cfg.get('horizontal_flip', True)),
+    )
+
+    # Callbacks
+    early_stopping = EarlyStopping(monitor='val_loss', patience=10, verbose=1)
+
+    model_checkpoint = ModelCheckpoint(
+        filepath=os.path.join(out_tmp, 'model-{epoch:02d}.h5'),
+        monitor='val_loss',
+        save_best_only=True
+    )
+    csv_logger = CSVLogger(os.path.join(out_tmp, 'training.log'))
+
+    reduce_lr = ReduceLROnPlateau(
+        monitor='val_loss',
+        factor=0.1,
+        patience=3,
+        verbose=1
+    )
+
+    tb = TensorBoard(log_dir=out_log)
+
+    # Train
+    batch_size = int(cfg.get('batch_size', 32))
+    epochs = int(cfg.get('epochs', 50))
+
+    print('Start:', datetime.datetime.now())
+    hist = model.fit(
+        datagen.flow(X_train, Y_train, batch_size=batch_size, seed=seed),
+        steps_per_epoch=max(1, X_train.shape[0] // batch_size),
+        epochs=epochs,
+        validation_data=(X_valid, Y_valid),
+        callbacks=[reduce_lr, model_checkpoint, csv_logger, tb, early_stopping],
+        shuffle=True,
+        verbose=1
+    )
+    print('End  :', datetime.datetime.now())
+
+    # Plot loss
+    plt.figure(figsize=(12, 4))
+    plt.plot(hist.history.get('loss', []), label='RMSE (train)', marker='o')
+    plt.plot(hist.history.get('val_loss', []), label='RMSE (val)', marker='o')
+    plt.ylabel('RMSE')
+    plt.xlabel('Epoch')
+    plt.legend(loc='best')
+    plt.grid(color='gray', alpha=0.2)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_tmp, 'loss_curve.png'), dpi=200)
+
+    # Evaluate
+    score = model.evaluate(X_test, Y_test, verbose=1)
+    print(f"evaluate loss (RMSE): {score}")
+
+    # Save models
+    model.save(os.path.join(out_model, 'model.hdf5'))
+    model.save(os.path.join(out_tmp, 'model.hdf5'))
+    model.save(os.path.join(out_model, 'model-opt.hdf5'), include_optimizer=False)
+    model.save(os.path.join(out_tmp, 'model-opt.hdf5'), include_optimizer=False)
+
+    # Save history
+    with open(os.path.join(out_tmp, 'history.json'), 'w', encoding='utf-8') as f:
+        json.dump(hist.history, f, ensure_ascii=False, indent=2)
+
+    # Predict first 30 and visualize
+    n_show = min(30, X_test.shape[0])
+    preds = model.predict(X_test[:n_show])
+
+    plt.figure(figsize=(16, 6))
+    for i in range(n_show):
+        plt.subplot(3, 10, i + 1)
+        plt.axis('off')
+        pred = round(float(preds[i][0]), 3)
+        true = round(float(Y_test[i]), 3)
+        # Threshold used in original script; adjust as needed
+        if abs(pred - true) < 0.581:
+            plt.title(f"{true}
+{pred}")
+        else:
+            plt.title(f"{true}
+{pred}", color='red')
+        plt.imshow(X_test[i])
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_tmp, 'pred_examples.png'), dpi=200)
+
+
+if __name__ == '__main__':
+    main()
